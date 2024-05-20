@@ -337,7 +337,7 @@ class Tvbox extends Base
                         $subtypes[] = ['n'=>$t['type_name'], 'v'=>$t['type_id']];
                     }
                 }
-                if(!empty(subtypes)){
+                if(!empty($subtypes)){
                     $typefilter[] = ['key'=>'st', 'name'=>'分类', 'value'=>$subtypes];
                 }
 
