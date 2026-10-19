@@ -1,16 +1,84 @@
 <?php
 namespace app\api\controller;
-use think\Controller;
 use think\Cache;
 
 class Tvbox extends Base
 {
-    var $_param;
+    private const FILTER_KEYS = ['st', 'year', 'area', 'h', 'isend', 'order_by'];
+    private const SORT_OPTIONS = [
+        'vod_douban_score' => '按豆瓣评分',
+        'vod_hits' => '按点击数',
+        'vod_pubdate' => '按上映时间',
+        'vod_year' => '按年度',
+        'vod_time' => '按更新时间',
+    ];
+
+    public $_param;
 
     public function __construct()
     {
         parent::__construct();
-        $this->_param = input('','','trim,urldecode');
+        // HTTP 参数已经解码，再次 urldecode 会破坏搜索词中的 + 和 %。
+        $this->_param = $this->normalizeParams(input('', '', 'trim'));
+    }
+
+    private function normalizeParams(array $params): array
+    {
+        $filters = isset($params['f']) && is_string($params['f'])
+            ? json_decode($params['f'], true) : null;
+        if (is_array($filters)) {
+            foreach (self::FILTER_KEYS as $key) {
+                // 兼容影视的 JSON 筛选；TVBox 的显式平铺参数优先，包括空值。
+                if (!array_key_exists($key, $params)
+                    && isset($filters[$key]) && is_scalar($filters[$key])) {
+                    $params[$key] = trim((string)$filters[$key]);
+                }
+            }
+        }
+        foreach (self::FILTER_KEYS as $key) {
+            if (isset($params[$key]) && !is_scalar($params[$key])) {
+                unset($params[$key]);
+            }
+        }
+        return $params + ['ac' => '', 'at' => ''];
+    }
+
+    private function applyDefaultFilters(): void
+    {
+        if (!empty($this->_param['ids']) || $this->_param['ac'] !== 'detail'
+            || empty($this->_param['t']) || !empty($this->_param['f'])) {
+            return;
+        }
+        foreach (['year', 'area'] as $key) {
+            $default = $GLOBALS['config']['extra']['tvbox_default_' . $key] ?? '';
+            if (!array_key_exists($key, $this->_param) && $default !== '') {
+                $this->_param[$key] = $default;
+            }
+        }
+    }
+
+    private function parseYears($value): array
+    {
+        if (!is_scalar($value)) {
+            return [];
+        }
+        $value = trim((string)$value);
+        if (preg_match('/^\d{4}$/D', $value)) {
+            return [$value];
+        }
+        if (!preg_match('/^(\d{4})[-,](\d{4})$/D', $value, $match)) {
+            return [];
+        }
+        $start = max(1900, min((int)$match[1], (int)$match[2]));
+        $end = min((int)date('Y') + 3, max((int)$match[1], (int)$match[2]));
+        return $start <= $end ? array_map('strval', range($start, $end)) : [];
+    }
+
+    private function getOrder(): string
+    {
+        $field = $this->_param['order_by'] ?? '';
+        // 排序列不能作为普通查询值绑定，只允许接口提供的固定字段。
+        return (is_string($field) && isset(self::SORT_OPTIONS[$field]) ? $field : 'vod_time') . ' desc';
     }
 
     public function index()
@@ -32,34 +100,15 @@ class Tvbox extends Base
             }
         }
 
+        $this->applyDefaultFilters();
         $cache_time = intval($GLOBALS['config']['api']['vod']['cachetime']);
-        $cach_name = $GLOBALS['config']['app']['cache_flag']. '_'.'api_vod_'.md5(http_build_query($this->_param));
+        $cach_name = $GLOBALS['config']['app']['cache_flag']. '_'.'api_tvbox_compat_v2_'.md5(http_build_query($this->_param));
         $html = Cache::get($cach_name);
         if(empty($html) || $cache_time==0) {
             $where = [];
             if (!empty($this->_param['ids'])) {
                 $where['vod_id'] = ['in', $this->_param['ids']];
-            }else{
-                //点击一级分类时，未进行筛选时，增加默认条件
-                if(empty($this->_param['f']) and $this->_param['ac'] == 'detail' and !empty($this->_param['t'])){
-                    $defYear = $GLOBALS['config']['extra']['tvbox_default_year'];
-                    $defArea = $GLOBALS['config']['extra']['tvbox_default_area'];
-                    if(!empty($defYear)){
-                        $this->_param['year'] = $defYear;
-                    }
-                    if(!empty($defArea)){
-                        $this->_param['area'] = $defArea;
-                    }
-                }
             }
-            // if (!empty($GLOBALS['config']['api']['vod']['typefilter'])) {
-            //     $where['type_id'] = ['in', $GLOBALS['config']['api']['vod']['typefilter']];
-            // }
-            
-            // if (empty($GLOBALS['config']['api']['vod']['typefilter']) || strpos($GLOBALS['config']['api']['vod']['typefilter'], $this->_param['t']) !== false) {
-                
-            // }
-            
             //有二级分类时，精确搜索
             if (!empty($this->_param['st'])) {
                 $where['type_id'] = $this->_param['st'];
@@ -75,8 +124,8 @@ class Tvbox extends Base
             }
 
             // 支持isend参数，是否完结
-            if (isset($this->_param['isend'])) {
-                $where['vod_isend'] = $this->_param['isend'] == 1 ? 1 : 0;
+            if (isset($this->_param['isend']) && in_array((string)$this->_param['isend'], ['0', '1'], true)) {
+                $where['vod_isend'] = (int)$this->_param['isend'];
             }
             if (!empty($this->_param['h'])) {
                 $todaydate = date('Y-m-d', strtotime('+1 days'));
@@ -90,28 +139,9 @@ class Tvbox extends Base
             if (!empty($this->_param['wd'])) {
                 $where['vod_name'] = ['like', '%' . $this->_param['wd'] . '%'];
             }
-            // 增加年份筛选 https://github.com/magicblack/maccms10/issues/815
-            if (!empty($this->_param['year'])) {
-                $param_year = trim($this->_param['year']);
-                if (strlen($param_year) == 4) {
-                    $year = intval($param_year);
-                } elseif (strlen($param_year) == 9) {
-                    $start = (int)substr($param_year, 0, 4);
-                    $end = (int)substr($param_year, 5, 4);
-                    if ($start > $end) {
-                        $tmp_num = $end;
-                        $end = $start;
-                        $start = $tmp_num;
-                    }
-                    $tmp_arr = [];
-                    $start = max($start, 1900);
-                    $end = min($end, date('Y') + 3);
-                    for ($i = $start; $i <= $end; $i++) {
-                        $tmp_arr[] = $i;
-                    }
-                    $year = join(',', $tmp_arr);
-                }
-                $where['vod_year'] = ['in', explode(',', $year)];
+            $years = $this->parseYears($this->_param['year'] ?? '');
+            if ($years) {
+                $where['vod_year'] = ['in', $years];
             }
 
             if (empty($GLOBALS['config']['api']['vod']['from']) && !empty($this->_param['from']) && strlen($this->_param['from']) > 2) {
@@ -131,7 +161,7 @@ class Tvbox extends Base
                 }
             }
             if (!empty($GLOBALS['config']['api']['vod']['datafilter'])) {
-                $where['_string'] .= ' ' . $GLOBALS['config']['api']['vod']['datafilter'];
+                $where['_string'] = $GLOBALS['config']['api']['vod']['datafilter'];
             }
             if (empty($this->_param['pg'])) {
                 $this->_param['pg'] = 1;
@@ -141,13 +171,10 @@ class Tvbox extends Base
                 $pagesize = min((int)$this->_param['pagesize'], 100);
             }
 
-            // $sort_direction = !empty($this->_param['sort_direction']) && $this->_param['sort_direction'] == 'asc' ? 'asc' : 'desc';
-            $order = 'vod_time desc';
-            if(!empty($this->_param['order_by'])){
-                $order = $this->_param['order_by'] . ' desc';
-            }
+            $order = $this->getOrder();
 
-            $field = 'vod_id,vod_name,type_id,"" as type_name,vod_en,vod_time,vod_remarks,vod_play_from,vod_time';
+            // A cover lets FongMi display results without its category-filtered detail fallback.
+            $field = 'vod_id,vod_name,type_id,"" as type_name,vod_en,vod_time,vod_remarks,vod_play_from,vod_pic,vod_year';
 
             if ($this->_param['ac'] == 'videolist' || $this->_param['ac'] == 'detail') {
                 $field = '*';
@@ -181,31 +208,21 @@ class Tvbox extends Base
     {
         $res_xml = '';
         $res_json = [];
-        $arr1 = explode("$$$",$urls); $arr1count = count($arr1);
-        $arr2 = explode("$$$",$froms); $arr2count = count($arr2);
-        for ($i=0;$i<$arr2count;$i++){
-            if ($arr1count >= $i){
-                if($from!=''){
-                    if($arr2[$i]==$from || str_contains($from, $arr2[$i])){
-                        $res_xml .=  '<dd flag="'. $arr2[$i] .'"><![CDATA[' . $arr1[$i]. ']]></dd>';
-                        $res_json[$arr2[$i]] = $arr1[$i];
-                    }
-                }
-                else{
-                    $res_xml .=  '<dd flag="'. $arr2[$i] .'"><![CDATA[' . $arr1[$i]. ']]></dd>';
-                    $res_json[$arr2[$i]] = $arr1[$i];
-                }
+        $groups = explode('$$$', $urls);
+        $allowed = array_map('trim', explode(',', $from));
+        foreach (explode('$$$', $froms) as $index => $source) {
+            if (!isset($groups[$index]) || $source === ''
+                || ($from !== '' && !in_array($source, $allowed, true))) {
+                continue;
             }
+            $res_xml .= '<dd flag="' . $this->xmlText($source) . '">' . $this->xmlCdata($groups[$index]) . '</dd>';
+            $res_json[$source] = $groups[$index];
         }
-        $res = str_replace(array(chr(10),chr(13)),array('','#'),$res_xml);
-        return $flag=='xml' ? $res_xml : $res_json;
+        return $flag == 'xml' ? $res_xml : $res_json;
     }
 
     public function sortArray($a, $b){
-        if($a['type_sort'] == $b['type_sort']){
-            return 0;
-        }
-        return $a['type_sort'] > $b['type_sort'] ? 1 : -1;
+        return $a['type_sort'] <=> $b['type_sort'];
     }
 
     private function getChildIds($pid){
@@ -222,91 +239,30 @@ class Tvbox extends Base
     public function vod_json($res)
     {
         $type_list = model('Type')->getCache('type_list');
-        //排序
-        usort($type_list, function ($a, $b){
-            if($a['type_sort'] == $b['type_sort']){
-                return 0;
-            }
-            return $a['type_sort'] > $b['type_sort'] ? 1 : -1;
-        });
-
-        foreach($res['list'] as $k=>&$v){
-            $type_info = $type_list[$v['type_id']];
-            $v['type_name'] = $type_info['type_name'];
-            $v['vod_time'] = date('Y-m-d H:i:s',$v['vod_time']);
-
-            if(substr($v["vod_pic"],0,4)=="mac:"){
-                $v["vod_pic"] = str_replace('mac:',$this->getImgUrlProtocol('vod'), $v["vod_pic"]);
-            }
-            elseif(!empty($v["vod_pic"]) && substr($v["vod_pic"],0,4)!="http" && substr($v["vod_pic"],0,2)!="//"){
-                $v["vod_pic"] = $GLOBALS['config']['api']['vod']['imgurl'] . $v["vod_pic"];
-            }
-
-            if ($this->_param['ac']=='videolist' || $this->_param['ac']=='detail') {
-                // 如果指定返回播放组，则只返回对应播放组的播放数据
-                // https://github.com/magicblack/maccms10/issues/957
-                if (!empty($GLOBALS['config']['api']['vod']['from'])) {
-                    // 准备数据，逐个处理
-                    $arr_from = explode('$$$', $v['vod_play_from']);
-                    $arr_url = explode('$$$', $v['vod_play_url']);
-                    $arr_server = explode('$$$', $v['vod_play_server']);
-                    $arr_note = explode('$$$', $v['vod_play_note']);
-                    $vod_play_from_list = explode(',', trim($GLOBALS['config']['api']['vod']['from']));
-                    $vod_play_from_list = array_unique($vod_play_from_list);
-                    $vod_play_from_list = array_filter($vod_play_from_list);
-                    $vod_play_url_list = [];
-                    $vod_play_server_list = [];
-                    $vod_play_note_list = [];
-                    foreach ($vod_play_from_list as $vod_play_from_index => $vod_play_from) {
-                        $key = array_search($vod_play_from, $arr_from);
-                        if ($key === false) {
-                            unset($vod_play_from_list[$vod_play_from_index]);
-                            continue;
-                        }
-                        $vod_play_url_list[] = $arr_url[$key];
-                        $vod_play_server_list[] = $arr_server[$key];
-                        $vod_play_note_list[] = $arr_note[$key];
-                    }
-                    $vod_play_from_list = convertPlayerName($vod_play_from_list);
-                    $res['list'][$k]['vod_play_from'] = join(',', $vod_play_from_list);
-                    $res['list'][$k]['vod_play_url'] = join('$$$', $vod_play_url_list);
-                    $res['list'][$k]['vod_play_server'] = join('$$$', $vod_play_server_list);
-                    $res['list'][$k]['vod_play_note'] = join('$$$', $vod_play_note_list);
-                }
-            } else {
-                if (!empty($GLOBALS['config']['api']['vod']['from'])) {
-                    // 准备数据，逐个处理
-                    $arr_from = explode('$$$', $v['vod_play_from']);
-                    $vod_play_from_list = explode(',', trim($GLOBALS['config']['api']['vod']['from']));
-                    $vod_play_from_list = array_unique($vod_play_from_list);
-                    $vod_play_from_list = array_filter($vod_play_from_list);
-                    foreach ($vod_play_from_list as $vod_play_from_index => $vod_play_from) {
-                        $key = array_search($vod_play_from, $arr_from);
-                        if ($key === false) {
-                            unset($vod_play_from_list[$vod_play_from_index]);
-                            continue;
-                        }
-                    }
-                    $vod_play_from_list = convertPlayerName($vod_play_from_list);
-                    $res['list'][$k]['vod_play_from'] = join(',', $vod_play_from_list);
-                } else {
-                   // $arr_from = explode('$$$', $v['vod_play_from']);
-                    // $vod_play_from_list = convertPlayerName($arr_from);
-                    //$res['list'][$k]['vod_play_from'] = '';//join(',', $vod_play_from_list);
-                }
-            }
-
-            //显示播放器名称
-            $arr_from = explode('$$$', $v['vod_play_from']);
-            $vod_play_from_names = $this->convertPlayerName($arr_from);
-            $res['list'][$k]['vod_play_from'] =join('$$$', $vod_play_from_names);
+        $detail = in_array($this->_param['ac'], ['detail', 'videolist'], true);
+        // 详情只需按 ID 查找；输出分类时才排序，并保留分类键。
+        if (!$detail) {
+            uasort($type_list, [$this, 'sortArray']);
         }
 
-        if($this->_param['ac']!='videolist' && $this->_param['ac']!='detail') {
+        foreach($res['list'] as &$v){
+            $v['type_name'] = $type_list[$v['type_id']]['type_name'] ?? '';
+            $v['vod_time'] = date('Y-m-d H:i:s',$v['vod_time']);
+
+            $v['vod_pic'] = $this->pictureUrl($v['vod_pic'] ?? '');
+
+            if (!empty($GLOBALS['config']['api']['vod']['from'])) {
+                $v = $this->filterPlaySources($v, $detail);
+            }
+            $v['vod_play_from'] = implode('$$$', $this->convertPlayerName(explode('$$$', $v['vod_play_from'])));
+        }
+        unset($v);
+
+        if (!$detail) {
             $class = [];
             $typefilter  = explode(',',$GLOBALS['config']['api']['vod']['typefilter']);
 
-            foreach ($type_list as $k=>&$v) {
+            foreach ($type_list as $v) {
                 if (!empty($GLOBALS['config']['api']['vod']['typefilter'])){
                     if(in_array($v['type_id'],$typefilter)) {
                         $class[] = ['type_id' => $v['type_id'], 'type_pid' => $v['type_pid'], 'type_name' => $v['type_name'],
@@ -341,9 +297,9 @@ class Tvbox extends Base
                     $typefilter[] = ['key'=>'st', 'name'=>'分类', 'value'=>$subtypes];
                 }
 
-                $type_extend = $type_list[$type_id]['type_extend'];
+                $type_extend = $type_list[$type_id]['type_extend'] ?? [];
                 //分类扩展配置：年代 -->全局年代
-                $yearConfig = $type_extend['year'];
+                $yearConfig = $type_extend['year'] ?? '';
                 if(empty($yearConfig)){
                     $yearConfig = $GLOBALS['config']['app']['vod_extend_year'];
                 }
@@ -357,7 +313,7 @@ class Tvbox extends Base
                 }
                
                 //分类扩展配置：地区 -->全局地区
-                $areaConfig = $type_extend['area'];
+                $areaConfig = $type_extend['area'] ?? '';
                 if(empty($areaConfig)){
                     $areaConfig = $GLOBALS['config']['app']['vod_extend_area'];
                 }
@@ -372,8 +328,11 @@ class Tvbox extends Base
 
                 $typefilter[] = ['key'=>'h','name'=>'更新', 'value'=> [['n'=>'今日', 'v'=>'24'],['n'=>'三天内', 'v'=>'72'],['n'=>'一周内', 'v'=>'168'],['n'=>'半月内', 'v'=>'360'],['n'=>'一月内', 'v'=>'720']]];
                 $typefilter[] = ['key'=>'isend','name'=>'完结', 'value'=> [['n'=>'已完结', 'v'=>'1'],['n'=>'未完结', 'v'=>'0']]];
-                $typefilter[] = ['key'=>'order_by','name'=>'排序', 'value'=> [['n'=>'按豆瓣评分', 'v'=>'vod_douban_score']
-                    ,['n'=>'按点击数', 'v'=>'vod_hits'],['n'=>'按上映时间', 'v'=>'vod_pubdate'],['n'=>'按年度', 'v'=>'vod_year'],['n'=>'按更新时间', 'v'=>'vod_time']]];
+                $sortValues = [];
+                foreach (self::SORT_OPTIONS as $field => $label) {
+                    $sortValues[] = ['n' => $label, 'v' => $field];
+                }
+                $typefilter[] = ['key' => 'order_by', 'name' => '排序', 'value' => $sortValues];
                 $filters[$type_id]=$typefilter;
             }
             $res['filters'] = $filters;
@@ -382,11 +341,34 @@ class Tvbox extends Base
         return $res;
     }
 
+    private function filterPlaySources(array $vod, bool $detail): array
+    {
+        $sources = explode('$$$', $vod['vod_play_from']);
+        $allowed = array_unique(array_filter(array_map('trim', explode(',', $GLOBALS['config']['api']['vod']['from'])), 'strlen'));
+        $indexes = [];
+        foreach ($allowed as $source) {
+            $index = array_search($source, $sources, true);
+            if ($index !== false) {
+                $indexes[] = $index;
+            }
+        }
+        $fields = $detail ? ['vod_play_from', 'vod_play_url', 'vod_play_server', 'vod_play_note'] : ['vod_play_from'];
+        foreach ($fields as $field) {
+            $values = explode('$$$', $vod[$field] ?? '');
+            $selected = [];
+            foreach ($indexes as $index) {
+                $selected[] = $values[$index] ?? '';
+            }
+            $vod[$field] = implode('$$$', $selected);
+        }
+        return $vod;
+    }
+
     public function convertPlayerName($players){
         $player_list = config('vodplayer');
         $result = [];
         foreach($players as $p){
-            $name = $player_list[$p]['show'];
+            $name = $player_list[$p]['show'] ?? '';
             if(empty($name)){
                 $result[] = $p;
             }else{
@@ -404,43 +386,35 @@ class Tvbox extends Base
 
         //视频列表开始
         $xml .= '<list page="'.$res['page'].'" pagecount="'.$res['pagecount'].'" pagesize="'.$res['limit'].'" recordcount="'.$res['total'].'">';
-        foreach($res['list'] as $k=>&$v){
-            $type_info = $type_list[$v['type_id']];
+        foreach($res['list'] as $v){
             $xml .= '<video>';
             $xml .= '<last>'.date('Y-m-d H:i:s',$v['vod_time']).'</last>';
             $xml .= '<id>'.$v['vod_id'].'</id>';
             $xml .= '<tid>'.$v['type_id'].'</tid>';
-            $xml .= '<name><![CDATA['.$v['vod_name'].']]></name>';
-            $xml .= '<type>'.$type_info['type_name'].'</type>';
-            if(substr($v["vod_pic"],0,4)=="mac:"){
-                $v["vod_pic"] = str_replace('mac:',$this->getImgUrlProtocol('vod'), $v["vod_pic"]);
-            }
-            elseif(!empty($v["vod_pic"]) && substr($v["vod_pic"],0,4)!="http"  && substr($v["vod_pic"],0,2)!="//"){
-                $v["vod_pic"] = $GLOBALS['config']['api']['vod']['imgurl'] . $v["vod_pic"];
-            }
+            $xml .= '<name>'.$this->xmlCdata($v['vod_name']).'</name>';
+            $xml .= '<type>'.$this->xmlText($type_list[$v['type_id']]['type_name'] ?? '').'</type>';
+            $v['vod_pic'] = $this->pictureUrl($v['vod_pic'] ?? '');
 
             if($this->_param['ac']=='videolist' || $this->_param['ac']=='detail'){
                 $tempurl = $this->vod_url_deal($v["vod_play_url"],$v["vod_play_from"],$GLOBALS['config']['api']['vod']['from'],'xml');
 
-                $xml .= '<pic>'.$v["vod_pic"].'</pic>';
-                $xml .= '<lang>'.$v['vod_lang'].'</lang>';
-                $xml .= '<area>'.$v['vod_area'].'</area>';
-                $xml .= '<year>'.$v['vod_year'].'</year>';
-                $xml .= '<state>'.$v['vod_serial'].'</state>';
-                $xml .= '<note><![CDATA['.$v['vod_remarks'].']]></note>';
-                $xml .= '<actor><![CDATA['.$v['vod_actor'].']]></actor>';
-                $xml .= '<director><![CDATA['.$v['vod_director'].']]></director>';
+                foreach (['pic'=>'vod_pic', 'lang'=>'vod_lang', 'area'=>'vod_area', 'year'=>'vod_year', 'state'=>'vod_serial'] as $tag=>$field) {
+                    $xml .= '<'.$tag.'>'.$this->xmlText($v[$field] ?? '').'</'.$tag.'>';
+                }
+                foreach (['note'=>'vod_remarks', 'actor'=>'vod_actor', 'director'=>'vod_director'] as $tag=>$field) {
+                    $xml .= '<'.$tag.'>'.$this->xmlCdata($v[$field] ?? '').'</'.$tag.'>';
+                }
                 $xml .= '<dl>'.$tempurl.'</dl>';
-                $xml .= '<des><![CDATA['.$v['vod_content'].']]></des>';
+                $xml .= '<des>'.$this->xmlCdata($v['vod_content'] ?? '').'</des>';
             }
             else {
                 if ($GLOBALS['config']['api']['vod']['from'] != ''){
-                    $xml .= '<dt>' . $GLOBALS['config']['api']['vod']['from'] . '</dt>';
+                    $xml .= '<dt>' . $this->xmlText($GLOBALS['config']['api']['vod']['from']) . '</dt>';
                 }
                 else{
-                    $xml .= '<dt>' . str_replace('$$$', ',', $v['vod_play_from']) . '</dt>';
+                    $xml .= '<dt>' . $this->xmlText(str_replace('$$$', ',', $v['vod_play_from'])) . '</dt>';
                 }
-                $xml .= '<note><![CDATA[' . $v['vod_remarks'] . ']]></note>';
+                $xml .= '<note>' . $this->xmlCdata($v['vod_remarks']) . '</note>';
             }
             $xml .= '</video>';
         }
@@ -452,25 +426,45 @@ class Tvbox extends Base
             //分类列表开始
             $xml .= "<class>";
             $typefilter  = explode(',',$GLOBALS['config']['api']['vod']['typefilter']);
-            foreach ($type_list as $k=>&$v) {
+            foreach ($type_list as $v) {
                 if($v['type_mid']==1) {
                     if (!empty($GLOBALS['config']['api']['vod']['typefilter'])){
                         if(in_array($v['type_id'],$typefilter)) {
-                            $xml .= "<ty id=\"" . $v["type_id"] . "\">" . $v["type_name"] . "</ty>";
+                            $xml .= '<ty id="' . $v['type_id'] . '">' . $this->xmlText($v['type_name']) . '</ty>';
                         }
                     }
                     else {
-                        $xml .= "<ty id=\"" . $v["type_id"] . "\">" . $v["type_name"] . "</ty>";
+                        $xml .= '<ty id="' . $v['type_id'] . '">' . $this->xmlText($v['type_name']) . '</ty>';
                     }
                 }
             }
-            unset($rs);
             $xml .= "</class>";
             //分类列表结束
 
         }
         $xml .= "</rss>";
         return $xml;
+    }
+
+    private function xmlText($value): string
+    {
+        return htmlspecialchars((string)$value, ENT_QUOTES | ENT_XML1 | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+    private function xmlCdata($value): string
+    {
+        return '<![CDATA[' . str_replace(']]>', ']]]]><![CDATA[>', (string)$value) . ']]>';
+    }
+
+    private function pictureUrl($picture): string
+    {
+        if (strpos($picture, 'mac:') === 0) {
+            return $this->getImgUrlProtocol('vod') . substr($picture, 4);
+        }
+        if ($picture !== '' && strpos($picture, 'http') !== 0 && strpos($picture, '//') !== 0) {
+            return ($GLOBALS['config']['api']['vod']['imgurl'] ?? '') . $picture;
+        }
+        return $picture;
     }
 
     private function checkDomainAuth($auth)
